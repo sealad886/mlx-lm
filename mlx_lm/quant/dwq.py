@@ -26,6 +26,16 @@ from mlx_lm.utils import (
 )
 
 
+def ensure_finite(value, *, label: str, iteration: int):
+    """Reject a non-finite scalar before another optimizer update can run."""
+    finite = mx.all(mx.isfinite(value))
+    mx.eval(finite)
+    if not bool(finite.item()):
+        raise FloatingPointError(
+            f"DWQ iteration {iteration} produced non-finite {label}; aborting"
+        )
+
+
 def compute_dwq_targets(
     model,
     save_dir,
@@ -137,7 +147,7 @@ def dwq_quantize(
             leave=False,
         ):
             batch = batch[:, :-1]
-            targets = target_fn(batch, i, split="valid")
+            targets = target_fn(batch, i, split="valid", lengths=lengths)
             mx.eval(targets)
             loss, ntoks = loss_fn(params, batch, targets, lengths)
             mx.eval(loss, ntoks)
@@ -173,10 +183,11 @@ def dwq_quantize(
         )
     ):
         batch = batch[:, :-1]
-        targets = target_fn(batch, it, split="train")
+        targets = target_fn(batch, it, split="train", lengths=lengths)
         mx.eval(targets)
         loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
+        ensure_finite(loss, label="loss", iteration=it)
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
         tokens += ntoks
@@ -372,13 +383,15 @@ def main():
 
     if has_targets:
 
-        def target_fn(_, idx, split):
+        def target_fn(_, idx, split, lengths=None):
+            del lengths
             targets = mx.load(target_dir / split / f"{idx:010d}.safetensors")
             return targets["logits"], targets["indices"]
 
     else:
 
-        def target_fn(batch, idx, split):
+        def target_fn(batch, idx, split, lengths=None):
+            del idx, split, lengths
             return model(batch)
 
     if args.quantized_model is not None:
