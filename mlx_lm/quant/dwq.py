@@ -36,6 +36,11 @@ def ensure_finite(value, *, label: str, iteration: int):
         )
 
 
+def emit_dwq_event(event_fn, kind: str, **fields):
+    if event_fn is not None:
+        event_fn(kind, fields)
+
+
 def compute_dwq_targets(
     model,
     save_dir,
@@ -88,6 +93,7 @@ def dwq_quantize(
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
+    event_fn=None,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -138,6 +144,7 @@ def dwq_quantize(
     def validate(params, it):
         v_loss = 0.0
         v_tokens = 0
+        emit_dwq_event(event_fn, "validation_start", iteration=it)
         for i, (batch, lengths) in tqdm(
             enumerate(
                 iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
@@ -157,6 +164,12 @@ def dwq_quantize(
             v_loss += loss * ntoks
         loss = v_loss / v_tokens
         rprint(f"Validation: {it=}, {loss=:.3f}")
+        emit_dwq_event(
+            event_fn,
+            "validation_result",
+            iteration=it,
+            loss=loss,
+        )
         return loss
 
     # Accumulate learned weights in higher precision
@@ -165,11 +178,11 @@ def dwq_quantize(
         model.trainable_parameters(),
     )
 
-    total_loss = 0.0
+    run_started = time.time()
+    summary_started = run_started
+    summary_tokens = 0
+    summary_weighted_loss = 0.0
     total_tokens = 0
-    tokens = 0
-
-    tic = time.time()
 
     # Compute initial validation loss
     initial_valid_loss = valid_loss = validate(params, it=0)
@@ -190,22 +203,37 @@ def dwq_quantize(
         ensure_finite(loss, label="loss", iteration=it)
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
-        tokens += ntoks
-        total_loss += loss * ntoks
+        summary_tokens += ntoks
+        summary_weighted_loss += loss * ntoks
+        total_tokens += ntoks
+        elapsed = max(time.time() - run_started, 1e-9)
+        summary_elapsed = max(time.time() - summary_started, 1e-9)
+        emit_dwq_event(
+            event_fn,
+            "training_iteration",
+            iteration=it + 1,
+            total_iterations=len(train_data) // batch_size,
+            loss=loss,
+            rolling_loss=summary_weighted_loss / summary_tokens,
+            tokens=total_tokens,
+            tokens_per_second=summary_tokens / summary_elapsed,
+            elapsed=elapsed,
+            peak_memory_gb=mx.get_peak_memory() / 1e9,
+        )
         if rank == 0:
             pbar.set_description(desc=f"{loss=:.4f}")
             if (it + 1) % 20 == 0:
-                toks_per_sec = tokens / (time.time() - tic)
+                toks_per_sec = summary_tokens / summary_elapsed
                 peak_memory_gb = mx.get_peak_memory() / 1e9
-                avg_loss = total_loss / tokens
-                total_tokens += tokens
+                avg_loss = summary_weighted_loss / summary_tokens
                 rprint(
                     f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
                     f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
                 )
-                tic = time.time()
-                tokens = 0
-                total_loss = 0
+        if (it + 1) % 20 == 0:
+            summary_started = time.time()
+            summary_tokens = 0
+            summary_weighted_loss = 0.0
         if (it + 1) % 200 == 0:
             valid_loss = validate(params, it=it)
 
