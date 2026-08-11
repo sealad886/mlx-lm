@@ -47,6 +47,15 @@ def emit_dwq_event(event_fn, kind: str, **fields):
         event_fn(kind, fields)
 
 
+def checkpoint_due(completed_iterations: int, interval: int) -> bool:
+    """Return whether durable state should be written after this update."""
+    return (
+        interval > 0
+        and completed_iterations > 0
+        and completed_iterations % interval == 0
+    )
+
+
 def report_trainable_parameters(model, event_fn=None) -> int:
     """Print and emit the already-computed post-unfreeze trainable count."""
     trainable_parameters = print_trainable_parameters(model)
@@ -112,6 +121,12 @@ def dwq_quantize(
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
     event_fn=None,
+    start_iteration: int = 0,
+    initial_params=None,
+    optimizer_state=None,
+    initial_valid_loss=None,
+    checkpoint_fn=None,
+    checkpoint_interval: int = 0,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -191,10 +206,16 @@ def dwq_quantize(
         return loss
 
     # Accumulate learned weights in higher precision
-    params = tree_map(
-        lambda x: x.astype(mx.float32),
-        model.trainable_parameters(),
+    params = (
+        initial_params
+        if initial_params is not None
+        else tree_map(
+            lambda x: x.astype(mx.float32),
+            model.trainable_parameters(),
+        )
     )
+    if optimizer_state is not None:
+        opt.state = optimizer_state
 
     run_started = time.time()
     summary_started = run_started
@@ -203,8 +224,20 @@ def dwq_quantize(
     total_tokens = 0
 
     # Compute initial validation loss
-    initial_valid_loss = valid_loss = validate(params, it=0)
+    if start_iteration:
+        if initial_valid_loss is None:
+            raise ValueError("initial_valid_loss is required when resuming DWQ")
+        valid_loss = initial_valid_loss
+        emit_dwq_event(
+            event_fn,
+            "training_resume",
+            iteration=start_iteration,
+            total_iterations=len(train_data) // batch_size,
+        )
+    else:
+        initial_valid_loss = valid_loss = validate(params, it=0)
 
+    last_iteration = max(0, start_iteration - 1)
     for it, (batch, lengths) in (
         pbar := tqdm(
             enumerate(
@@ -213,6 +246,8 @@ def dwq_quantize(
             total=len(train_data) // batch_size,
         )
     ):
+        if it < start_iteration:
+            continue
         batch = batch[:, :-1]
         targets = target_fn(batch, it, split="train", lengths=lengths)
         mx.eval(targets)
@@ -224,6 +259,7 @@ def dwq_quantize(
         summary_tokens += ntoks
         summary_weighted_loss += loss * ntoks
         total_tokens += ntoks
+        last_iteration = it
         elapsed = max(time.time() - run_started, 1e-9)
         summary_elapsed = max(time.time() - summary_started, 1e-9)
         emit_dwq_event(
@@ -255,7 +291,31 @@ def dwq_quantize(
         if (it + 1) % 200 == 0:
             valid_loss = validate(params, it=it)
 
-    valid_loss = validate(params, it=it)
+        if checkpoint_fn is not None and checkpoint_due(it + 1, checkpoint_interval):
+            mx.eval(params, opt.state)
+            checkpoint_fn(
+                it + 1,
+                params,
+                opt.state,
+                initial_valid_loss,
+                valid_loss,
+            )
+
+    valid_loss = validate(params, it=last_iteration)
+    completed_iterations = last_iteration + 1
+    if (
+        checkpoint_fn is not None
+        and completed_iterations > 0
+        and not checkpoint_due(completed_iterations, checkpoint_interval)
+    ):
+        mx.eval(params, opt.state)
+        checkpoint_fn(
+            completed_iterations,
+            params,
+            opt.state,
+            initial_valid_loss,
+            valid_loss,
+        )
     if initial_valid_loss < valid_loss:
         rprint(
             f"❌❌❌\n[WARNING] Final validation loss {valid_loss:.3f} is "
