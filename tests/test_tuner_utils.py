@@ -78,8 +78,9 @@ class TestTunerUtils(unittest.TestCase):
             "layer3.weight": MagicMock(size=2e6),
         }
         expected_output = "Trainable parameters: 50.000% (3.000M/6.000M)\n"
-        print_trainable_parameters(model)
+        trainable_parameters = print_trainable_parameters(model)
         self.assertEqual(self.capturedOutput.getvalue(), expected_output)
+        self.assertEqual(3_000_000, trainable_parameters)
 
 
 if __name__ == "__main__":

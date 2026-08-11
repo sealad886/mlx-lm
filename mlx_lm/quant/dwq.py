@@ -26,19 +26,37 @@ from mlx_lm.utils import (
 )
 
 
-def ensure_finite(value, *, label: str, iteration: int):
+def ensure_finite(value, *, label: str, iteration: int, event_fn=None):
     """Reject a non-finite scalar before another optimizer update can run."""
     finite = mx.all(mx.isfinite(value))
     mx.eval(finite)
     if not bool(finite.item()):
-        raise FloatingPointError(
-            f"DWQ iteration {iteration} produced non-finite {label}; aborting"
+        message = f"DWQ iteration {iteration} produced non-finite {label}; aborting"
+        emit_dwq_event(
+            event_fn,
+            "nonfinite_loss",
+            iteration=iteration,
+            label=label,
+            message=message,
         )
+        raise FloatingPointError(message)
 
 
 def emit_dwq_event(event_fn, kind: str, **fields):
     if event_fn is not None:
         event_fn(kind, fields)
+
+
+def report_trainable_parameters(model, event_fn=None) -> int:
+    """Print and emit the already-computed post-unfreeze trainable count."""
+    trainable_parameters = print_trainable_parameters(model)
+    emit_dwq_event(
+        event_fn,
+        "metric",
+        name="trainable_parameters",
+        value=trainable_parameters,
+    )
+    return trainable_parameters
 
 
 def compute_dwq_targets(
@@ -114,7 +132,7 @@ def dwq_quantize(
 
     model.train()
     model.apply_to_modules(unfreeze)
-    print_trainable_parameters(model)
+    report_trainable_parameters(model, event_fn)
 
     if gradient_checkpoint:
         grad_checkpoint(model.layers[0])
@@ -200,7 +218,7 @@ def dwq_quantize(
         mx.eval(targets)
         loss, ntoks, params = step(batch, targets, lengths, params)
         mx.eval(loss, params)
-        ensure_finite(loss, label="loss", iteration=it)
+        ensure_finite(loss, label="loss", iteration=it, event_fn=event_fn)
         loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
         ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
         summary_tokens += ntoks

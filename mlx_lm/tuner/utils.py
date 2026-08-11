@@ -157,12 +157,14 @@ def remove_lora_layers(model: nn.Module) -> nn.Module:
     return model
 
 
-def print_trainable_parameters(model):
+def print_trainable_parameters(model) -> int:
     total_p = get_total_parameters(model) / 1e6
-    trainable_p = (
-        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
+    trainable_parameters = int(
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
     )
+    trainable_p = trainable_parameters / 1e6
     rprint(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )
+    return trainable_parameters
