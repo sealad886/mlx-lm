@@ -56,6 +56,11 @@ def checkpoint_due(completed_iterations: int, interval: int) -> bool:
     )
 
 
+def final_checkpoint_due(completed_iterations: int, interval: int) -> bool:
+    """Write final recovery state only when checkpointing is enabled and pending."""
+    return interval > 0 and not checkpoint_due(completed_iterations, interval)
+
+
 def report_trainable_parameters(model, event_fn=None) -> int:
     """Print and emit the already-computed post-unfreeze trainable count."""
     trainable_parameters = print_trainable_parameters(model)
@@ -306,7 +311,7 @@ def dwq_quantize(
     if (
         checkpoint_fn is not None
         and completed_iterations > 0
-        and not checkpoint_due(completed_iterations, checkpoint_interval)
+        and final_checkpoint_due(completed_iterations, checkpoint_interval)
     ):
         mx.eval(params, opt.state)
         checkpoint_fn(
