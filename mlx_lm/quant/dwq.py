@@ -73,6 +73,46 @@ def report_trainable_parameters(model, event_fn=None) -> int:
     return trainable_parameters
 
 
+def extract_logits(output):
+    """Return raw logits from MLX-LM arrays or MLX-VLM model outputs."""
+    logits = getattr(output, "logits", output)
+    if logits is None:
+        raise TypeError("Model output has a null 'logits' attribute")
+    return logits
+
+
+def save_interrupt_checkpoint(
+    checkpoint_fn,
+    *,
+    mx,
+    completed_iterations,
+    start_iteration,
+    params,
+    optimizer_state,
+    initial_valid_loss,
+    valid_loss,
+    event_fn=None,
+):
+    """Persist the last completed iteration before propagating an interrupt."""
+    if checkpoint_fn is None or completed_iterations <= start_iteration:
+        return False
+    mx.eval(params, optimizer_state)
+    checkpoint_fn(
+        completed_iterations,
+        params,
+        optimizer_state,
+        initial_valid_loss,
+        valid_loss,
+        force=True,
+    )
+    emit_dwq_event(
+        event_fn,
+        "interrupt_checkpoint",
+        iteration=completed_iterations,
+    )
+    return True
+
+
 def compute_dwq_targets(
     model,
     save_dir,
@@ -98,7 +138,7 @@ def compute_dwq_targets(
             )
         ):
             batch = batch[:, :-1]
-            logits = model(batch)
+            logits = extract_logits(model(batch))
             # Hack to make the last op pre-eval on the CPU to avoid even timeout
             logits = mx.stop_gradient(logits, stream=mx.cpu)
             mx.eval(logits)
@@ -161,7 +201,7 @@ def dwq_quantize(
 
     def loss_fn(params, x, targets, lengths):
         model.update(tree_map(lambda x: x.astype(dtype), params))
-        logits = model(x)
+        logits = extract_logits(model(x))
         if isinstance(targets, tuple):
             targets, ids = targets
             logits = mx.take_along_axis(logits, ids, axis=-1)
@@ -243,68 +283,96 @@ def dwq_quantize(
         initial_valid_loss = valid_loss = validate(params, it=0)
 
     last_iteration = max(0, start_iteration - 1)
-    for it, (batch, lengths) in (
-        pbar := tqdm(
-            enumerate(
-                iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
-            ),
-            total=len(train_data) // batch_size,
-        )
-    ):
-        if it < start_iteration:
-            continue
-        batch = batch[:, :-1]
-        targets = target_fn(batch, it, split="train", lengths=lengths)
-        mx.eval(targets)
-        loss, ntoks, params = step(batch, targets, lengths, params)
-        mx.eval(loss, params)
-        ensure_finite(loss, label="loss", iteration=it, event_fn=event_fn)
-        loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
-        ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
-        summary_tokens += ntoks
-        summary_weighted_loss += loss * ntoks
-        total_tokens += ntoks
-        last_iteration = it
-        elapsed = max(time.time() - run_started, 1e-9)
-        summary_elapsed = max(time.time() - summary_started, 1e-9)
-        emit_dwq_event(
-            event_fn,
-            "training_iteration",
-            iteration=it + 1,
-            total_iterations=len(train_data) // batch_size,
-            loss=loss,
-            rolling_loss=summary_weighted_loss / summary_tokens,
-            tokens=total_tokens,
-            tokens_per_second=summary_tokens / summary_elapsed,
-            elapsed=elapsed,
-            peak_memory_gb=mx.get_peak_memory() / 1e9,
-        )
-        if rank == 0:
-            pbar.set_description(desc=f"{loss=:.4f}")
-            if (it + 1) % 20 == 0:
-                toks_per_sec = summary_tokens / summary_elapsed
-                peak_memory_gb = mx.get_peak_memory() / 1e9
-                avg_loss = summary_weighted_loss / summary_tokens
-                rprint(
-                    f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
-                    f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
-                )
-        if (it + 1) % 20 == 0:
-            summary_started = time.time()
-            summary_tokens = 0
-            summary_weighted_loss = 0.0
-        if (it + 1) % 200 == 0:
-            valid_loss = validate(params, it=it)
-
-        if checkpoint_fn is not None and checkpoint_due(it + 1, checkpoint_interval):
-            mx.eval(params, opt.state)
-            checkpoint_fn(
-                it + 1,
-                params,
-                opt.state,
-                initial_valid_loss,
-                valid_loss,
+    last_completed_params = params
+    last_completed_optimizer_state = tree_map(lambda value: value, opt.state)
+    try:
+        for it, (batch, lengths) in (
+            pbar := tqdm(
+                enumerate(
+                    iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
+                ),
+                total=len(train_data) // batch_size,
             )
+        ):
+            if it < start_iteration:
+                continue
+            batch = batch[:, :-1]
+            targets = target_fn(batch, it, split="train", lengths=lengths)
+            mx.eval(targets)
+            loss, ntoks, params = step(batch, targets, lengths, params)
+            mx.eval(loss, params)
+            ensure_finite(loss, label="loss", iteration=it, event_fn=event_fn)
+            loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
+            ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
+            summary_tokens += ntoks
+            summary_weighted_loss += loss * ntoks
+            total_tokens += ntoks
+            last_iteration = it
+            last_completed_params = params
+            last_completed_optimizer_state = tree_map(lambda value: value, opt.state)
+            elapsed = max(time.time() - run_started, 1e-9)
+            summary_elapsed = max(time.time() - summary_started, 1e-9)
+            emit_dwq_event(
+                event_fn,
+                "training_iteration",
+                iteration=it + 1,
+                total_iterations=len(train_data) // batch_size,
+                loss=loss,
+                rolling_loss=summary_weighted_loss / summary_tokens,
+                tokens=total_tokens,
+                tokens_per_second=summary_tokens / summary_elapsed,
+                elapsed=elapsed,
+                peak_memory_gb=mx.get_peak_memory() / 1e9,
+            )
+            if rank == 0:
+                pbar.set_description(desc=f"{loss=:.4f}")
+                if (it + 1) % 20 == 0:
+                    toks_per_sec = summary_tokens / summary_elapsed
+                    peak_memory_gb = mx.get_peak_memory() / 1e9
+                    avg_loss = summary_weighted_loss / summary_tokens
+                    rprint(
+                        f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
+                        f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
+                    )
+            if (it + 1) % 20 == 0:
+                summary_started = time.time()
+                summary_tokens = 0
+                summary_weighted_loss = 0.0
+            if (it + 1) % 200 == 0:
+                valid_loss = validate(params, it=it)
+
+            if checkpoint_fn is not None and checkpoint_due(
+                it + 1, checkpoint_interval
+            ):
+                mx.eval(params, opt.state)
+                checkpoint_fn(
+                    it + 1,
+                    params,
+                    opt.state,
+                    initial_valid_loss,
+                    valid_loss,
+                )
+    except KeyboardInterrupt:
+        try:
+            save_interrupt_checkpoint(
+                checkpoint_fn,
+                mx=mx,
+                completed_iterations=last_iteration + 1,
+                start_iteration=start_iteration,
+                params=last_completed_params,
+                optimizer_state=last_completed_optimizer_state,
+                initial_valid_loss=initial_valid_loss,
+                valid_loss=valid_loss,
+                event_fn=event_fn,
+            )
+        except Exception as exc:
+            emit_dwq_event(
+                event_fn,
+                "interrupt_checkpoint_failed",
+                iteration=last_iteration + 1,
+                message=str(exc) or type(exc).__name__,
+            )
+        raise
 
     valid_loss = validate(params, it=last_iteration)
     completed_iterations = last_iteration + 1
