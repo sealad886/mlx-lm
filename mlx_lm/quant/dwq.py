@@ -103,7 +103,6 @@ def save_interrupt_checkpoint(
         optimizer_state,
         initial_valid_loss,
         valid_loss,
-        force=True,
     )
     emit_dwq_event(
         event_fn,

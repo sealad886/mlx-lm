@@ -47,7 +47,7 @@ class TestInterruptCheckpoint(unittest.TestCase):
         self.assertTrue(saved)
         self.assertEqual(("eval", ("params", "optimizer")), calls[0])
         self.assertEqual(5, calls[1][1][0])
-        self.assertEqual({"force": True}, calls[1][2])
+        self.assertEqual({}, calls[1][2])
 
     def test_skips_checkpoint_without_new_completed_iteration(self) -> None:
         saved = save_interrupt_checkpoint(

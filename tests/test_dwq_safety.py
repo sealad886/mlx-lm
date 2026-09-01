@@ -15,6 +15,11 @@ class TestDWQSafety(unittest.TestCase):
         self.assertTrue(due(20, 20))
         self.assertFalse(due(20, 0))
 
+    def test_checkpoint_interval_one_is_due_after_every_iteration(self):
+        self.assertTrue(
+            all(dwq.checkpoint_due(iteration, 1) for iteration in range(1, 6))
+        )
+
     def test_final_checkpoint_due_honors_disabled_interval(self):
         due = getattr(dwq, "final_checkpoint_due", None)
         self.assertTrue(callable(due), "DWQ final checkpoint helper is missing")
