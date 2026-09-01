@@ -11,7 +11,17 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -245,7 +255,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         )
         max_rec_size = mx.device_info()["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
-            model_mb = model_bytes // 2**20
+            model_mb = cast(int, model_bytes) // 2**20
             max_rec_mb = max_rec_size // 2**20
             print(
                 f"[WARNING] Generating with a model that requires {model_mb} MB "
@@ -526,8 +536,8 @@ def speculative_generate_step(
         model_cache = cache.make_prompt_cache(model)
         draft_cache = cache.make_prompt_cache(draft_model)
     else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        model_cache = prompt_cache[: len(cast(list | dict, model.layers))]
+        draft_cache = prompt_cache[len(cast(list | dict, model.layers)) :]
 
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
@@ -893,6 +903,7 @@ def mtp_generate_step(
             y = mx.array([main_tok.item()], mx.uint32)
         else:
             # Verify draft: run backbone over [y, draft_tok].
+            model.mtp_total_drafted = getattr(model, "mtp_total_drafted", 0) + 1
             # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
             # after the confirmed token y, enabling exact rollback on rejection.
             y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
@@ -924,6 +935,7 @@ def mtp_generate_step(
             hidden_at_draft = hidden[:, 1:2, :]
 
             if accept:
+                model.mtp_total_accepted = getattr(model, "mtp_total_accepted", 0) + 1
                 _clear_rollback()
                 ntoks += 1
                 yield draft_tok_id, draft_lp, True
