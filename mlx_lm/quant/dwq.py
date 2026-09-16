@@ -171,6 +171,7 @@ def dwq_quantize(
     initial_valid_loss=None,
     checkpoint_fn=None,
     checkpoint_interval: int = 0,
+    validation_interval: int = 200,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -337,7 +338,7 @@ def dwq_quantize(
                 summary_started = time.time()
                 summary_tokens = 0
                 summary_weighted_loss = 0.0
-            if (it + 1) % 200 == 0:
+            if checkpoint_due(it + 1, validation_interval):
                 valid_loss = validate(params, it=it)
 
             if checkpoint_fn is not None and checkpoint_due(

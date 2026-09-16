@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import MagicMock
 
@@ -8,6 +9,19 @@ import mlx_lm.quant.dwq as dwq
 
 
 class TestDWQSafety(unittest.TestCase):
+    def test_dwq_quantize_default_validation_interval_matches_legacy_cadence(self):
+        default = inspect.signature(dwq.dwq_quantize).parameters[
+            "validation_interval"
+        ].default
+        self.assertEqual(200, default)
+
+    def test_checkpoint_due_gates_validation_cadence(self):
+        # dwq_quantize reuses checkpoint_due to decide when a full
+        # validation pass is due during training.
+        self.assertFalse(dwq.checkpoint_due(199, 200))
+        self.assertTrue(dwq.checkpoint_due(200, 200))
+        self.assertFalse(dwq.checkpoint_due(200, 0))
+
     def test_checkpoint_due_uses_completed_iteration_interval(self):
         due = getattr(dwq, "checkpoint_due", None)
         self.assertTrue(callable(due), "DWQ checkpoint cadence helper is missing")
