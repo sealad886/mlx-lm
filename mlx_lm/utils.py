@@ -893,7 +893,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -904,6 +904,7 @@ def quantize_model(
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
+            bool_or_params = {**quant_params, **bool_or_params}
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
             quantized_config["quantization"][path] = quant_params
@@ -1049,6 +1050,16 @@ def common_prefix_len(list1, list2):
     # No mismatch found within the bounds of the shorter list,
     # so the common prefix length is the length of the shorter list.
     return min_len
+
+
+def does_model_support_mtp(model: nn.Module) -> bool:
+    """Return whether the model exposes a populated native MTP head."""
+    make_cache = getattr(model, "make_mtp_cache", None)
+    return (
+        callable(getattr(model, "mtp_forward", None))
+        and callable(make_cache)
+        and bool(make_cache())
+    )
 
 
 def does_model_support_input_embeddings(model: nn.Module) -> bool:

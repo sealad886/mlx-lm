@@ -31,6 +31,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "huggingface_hub",
     ],
     packages=[
         "mlx_lm",

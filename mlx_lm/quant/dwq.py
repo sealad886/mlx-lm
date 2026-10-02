@@ -27,6 +27,92 @@ from mlx_lm.utils import (
 )
 
 
+def ensure_finite(value, *, label: str, iteration: int, event_fn=None):
+    """Reject a non-finite scalar before another optimizer update can run."""
+    finite = mx.all(mx.isfinite(value))
+    mx.eval(finite)
+    if not bool(finite.item()):
+        message = f"DWQ iteration {iteration} produced non-finite {label}; aborting"
+        emit_dwq_event(
+            event_fn,
+            "nonfinite_loss",
+            iteration=iteration,
+            label=label,
+            message=message,
+        )
+        raise FloatingPointError(message)
+
+
+def emit_dwq_event(event_fn, kind: str, **fields):
+    if event_fn is not None:
+        event_fn(kind, fields)
+
+
+def checkpoint_due(completed_iterations: int, interval: int) -> bool:
+    """Return whether durable state should be written after this update."""
+    return (
+        interval > 0
+        and completed_iterations > 0
+        and completed_iterations % interval == 0
+    )
+
+
+def final_checkpoint_due(completed_iterations: int, interval: int) -> bool:
+    """Write final recovery state only when checkpointing is enabled and pending."""
+    return interval > 0 and not checkpoint_due(completed_iterations, interval)
+
+
+def report_trainable_parameters(model, event_fn=None) -> int:
+    """Print and emit the already-computed post-unfreeze trainable count."""
+    trainable_parameters = print_trainable_parameters(model)
+    emit_dwq_event(
+        event_fn,
+        "metric",
+        name="trainable_parameters",
+        value=trainable_parameters,
+    )
+    return trainable_parameters
+
+
+def extract_logits(output):
+    """Return raw logits from MLX-LM arrays or MLX-VLM model outputs."""
+    logits = getattr(output, "logits", output)
+    if logits is None:
+        raise TypeError("Model output has a null 'logits' attribute")
+    return logits
+
+
+def save_interrupt_checkpoint(
+    checkpoint_fn,
+    *,
+    mx,
+    completed_iterations,
+    start_iteration,
+    params,
+    optimizer_state,
+    initial_valid_loss,
+    valid_loss,
+    event_fn=None,
+):
+    """Persist the last completed iteration before propagating an interrupt."""
+    if checkpoint_fn is None or completed_iterations <= start_iteration:
+        return False
+    mx.eval(params, optimizer_state)
+    checkpoint_fn(
+        completed_iterations,
+        params,
+        optimizer_state,
+        initial_valid_loss,
+        valid_loss,
+    )
+    emit_dwq_event(
+        event_fn,
+        "interrupt_checkpoint",
+        iteration=completed_iterations,
+    )
+    return True
+
+
 def compute_dwq_targets(
     model,
     save_dir,
@@ -50,7 +136,7 @@ def compute_dwq_targets(
             disable=rank != 0,
         ):
             batch = batch[:, :-1]
-            logits = model(batch)
+            logits = extract_logits(model(batch))
             # Hack to make the last op pre-eval on the CPU to avoid even timeout
             logits = mx.stop_gradient(logits, stream=mx.cpu)
             mx.eval(logits)
@@ -77,6 +163,14 @@ def dwq_quantize(
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
+    event_fn=None,
+    start_iteration: int = 0,
+    initial_params=None,
+    optimizer_state=None,
+    initial_valid_loss=None,
+    checkpoint_fn=None,
+    checkpoint_interval: int = 0,
+    validation_interval: int = 200,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -97,7 +191,7 @@ def dwq_quantize(
 
     model.train()
     model.apply_to_modules(unfreeze)
-    print_trainable_parameters(model)
+    report_trainable_parameters(model, event_fn)
 
     if gradient_checkpoint:
         grad_checkpoint(model.layers[0])
@@ -106,7 +200,7 @@ def dwq_quantize(
 
     def loss_fn(params, x, targets, lengths):
         model.update(tree_map(lambda x: x.astype(dtype), params))
-        logits = model(x)
+        logits = extract_logits(model(x))
         if isinstance(targets, tuple):
             targets, ids = targets
             logits = mx.take_along_axis(logits, ids, axis=-1)
@@ -127,6 +221,7 @@ def dwq_quantize(
     def validate(params, it):
         v_loss = 0.0
         v_tokens = 0
+        emit_dwq_event(event_fn, "validation_start", iteration=it)
         for i, (batch, lengths) in tqdm(
             enumerate(
                 iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
@@ -136,7 +231,7 @@ def dwq_quantize(
             leave=False,
         ):
             batch = batch[:, :-1]
-            targets = target_fn(batch, i, split="valid")
+            targets = target_fn(batch, i, split="valid", lengths=lengths)
             mx.eval(targets)
             loss, ntoks = loss_fn(params, batch, targets, lengths)
             mx.eval(loss, ntoks)
@@ -146,58 +241,156 @@ def dwq_quantize(
             v_loss += loss * ntoks
         loss = v_loss / v_tokens
         rprint(f"Validation: {it=}, {loss=:.3f}")
+        emit_dwq_event(
+            event_fn,
+            "validation_result",
+            iteration=it,
+            loss=loss,
+        )
         return loss
 
     # Accumulate learned weights in higher precision
-    params = tree_map(
-        lambda x: x.astype(mx.float32),
-        model.trainable_parameters(),
+    params = (
+        initial_params
+        if initial_params is not None
+        else tree_map(
+            lambda x: x.astype(mx.float32),
+            model.trainable_parameters(),
+        )
     )
+    if optimizer_state is not None:
+        opt.state = optimizer_state
 
-    total_loss = 0.0
+    run_started = time.time()
+    summary_started = run_started
+    summary_tokens = 0
+    summary_weighted_loss = 0.0
     total_tokens = 0
-    tokens = 0
-
-    tic = time.time()
 
     # Compute initial validation loss
-    initial_valid_loss = valid_loss = validate(params, it=0)
-
-    for it, (batch, lengths) in (
-        pbar := tqdm(
-            enumerate(
-                iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
-            ),
-            total=len(train_data) // batch_size,
+    if start_iteration:
+        if initial_valid_loss is None:
+            raise ValueError("initial_valid_loss is required when resuming DWQ")
+        valid_loss = initial_valid_loss
+        emit_dwq_event(
+            event_fn,
+            "training_resume",
+            iteration=start_iteration,
+            total_iterations=len(train_data) // batch_size,
         )
-    ):
-        batch = batch[:, :-1]
-        targets = target_fn(batch, it, split="train")
-        mx.eval(targets)
-        loss, ntoks, params = step(batch, targets, lengths, params)
-        mx.eval(loss, params)
-        loss = mx.distributed.all_sum(loss, stream=mx.cpu).item() / world_size
-        ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu).item()
-        tokens += ntoks
-        total_loss += loss * ntoks
-        if rank == 0:
-            pbar.set_description(desc=f"{loss=:.4f}")
-            if (it + 1) % 20 == 0:
-                toks_per_sec = tokens / (time.time() - tic)
-                peak_memory_gb = mx.get_peak_memory() / 1e9
-                avg_loss = total_loss / tokens
-                total_tokens += tokens
-                rprint(
-                    f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
-                    f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
-                )
-                tic = time.time()
-                tokens = 0
-                total_loss = 0
-        if (it + 1) % 200 == 0:
-            valid_loss = validate(params, it=it)
+    else:
+        initial_valid_loss = valid_loss = validate(params, it=0)
 
-    valid_loss = validate(params, it=it)
+    last_iteration = start_iteration - 1
+    completed_iterations = start_iteration
+    last_completed_params = params
+    last_completed_optimizer_state = tree_map(lambda value: value, opt.state)
+    try:
+        for it, (batch, lengths) in (
+            pbar := tqdm(
+                enumerate(
+                    iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
+                ),
+                total=len(train_data) // batch_size,
+            )
+        ):
+            if it < start_iteration:
+                continue
+            batch = batch[:, :-1]
+            targets = target_fn(batch, it, split="train", lengths=lengths)
+            mx.eval(targets)
+            loss, ntoks, params = step(batch, targets, lengths, params)
+            mx.eval(loss, params)
+            loss = mx.distributed.all_sum(loss, stream=mx.cpu) / world_size
+            ntoks = mx.distributed.all_sum(ntoks, stream=mx.cpu)
+            ensure_finite(loss, label="loss", iteration=it, event_fn=event_fn)
+            loss = loss.item()
+            ntoks = ntoks.item()
+            summary_tokens += ntoks
+            summary_weighted_loss += loss * ntoks
+            total_tokens += ntoks
+            last_iteration = it
+            completed_iterations = it + 1
+            last_completed_params = params
+            last_completed_optimizer_state = tree_map(lambda value: value, opt.state)
+            elapsed = max(time.time() - run_started, 1e-9)
+            summary_elapsed = max(time.time() - summary_started, 1e-9)
+            emit_dwq_event(
+                event_fn,
+                "training_iteration",
+                iteration=it + 1,
+                total_iterations=len(train_data) // batch_size,
+                loss=loss,
+                rolling_loss=summary_weighted_loss / summary_tokens,
+                tokens=total_tokens,
+                tokens_per_second=summary_tokens / summary_elapsed,
+                elapsed=elapsed,
+                peak_memory_gb=mx.get_peak_memory() / 1e9,
+            )
+            if rank == 0:
+                pbar.set_description(desc=f"{loss=:.4f}")
+                if (it + 1) % 20 == 0:
+                    toks_per_sec = summary_tokens / summary_elapsed
+                    peak_memory_gb = mx.get_peak_memory() / 1e9
+                    avg_loss = summary_weighted_loss / summary_tokens
+                    rprint(
+                        f"{it=}, {avg_loss=:.4f}, {total_tokens=},"
+                        f" {toks_per_sec=:.3f}, {peak_memory_gb=:.3f}",
+                    )
+            if (it + 1) % 20 == 0:
+                summary_started = time.time()
+                summary_tokens = 0
+                summary_weighted_loss = 0.0
+            if checkpoint_due(it + 1, validation_interval):
+                valid_loss = validate(params, it=it)
+
+            if checkpoint_fn is not None and checkpoint_due(
+                it + 1, checkpoint_interval
+            ):
+                mx.eval(params, opt.state)
+                checkpoint_fn(
+                    it + 1,
+                    params,
+                    opt.state,
+                    initial_valid_loss,
+                    valid_loss,
+                )
+    except KeyboardInterrupt:
+        try:
+            save_interrupt_checkpoint(
+                checkpoint_fn,
+                mx=mx,
+                completed_iterations=completed_iterations,
+                start_iteration=start_iteration,
+                params=last_completed_params,
+                optimizer_state=last_completed_optimizer_state,
+                initial_valid_loss=initial_valid_loss,
+                valid_loss=valid_loss,
+                event_fn=event_fn,
+            )
+        except Exception as exc:
+            emit_dwq_event(
+                event_fn,
+                "interrupt_checkpoint_failed",
+                iteration=completed_iterations,
+                message=str(exc) or type(exc).__name__,
+            )
+        raise
+
+    valid_loss = validate(params, it=last_iteration)
+    if (
+        checkpoint_fn is not None
+        and completed_iterations > 0
+        and final_checkpoint_due(completed_iterations, checkpoint_interval)
+    ):
+        mx.eval(params, opt.state)
+        checkpoint_fn(
+            completed_iterations,
+            params,
+            opt.state,
+            initial_valid_loss,
+            valid_loss,
+        )
     if initial_valid_loss < valid_loss:
         rprint(
             f"❌❌❌\n[WARNING] Final validation loss {valid_loss:.3f} is "
@@ -371,14 +564,16 @@ def main():
 
     if has_targets:
 
-        def target_fn(_, idx, split):
+        def target_fn(_, idx, split, lengths=None):
+            del lengths
             targets = mx.load(target_dir / split / f"{idx:010d}.safetensors")
             return targets["logits"], targets["indices"]
 
     else:
 
-        def target_fn(batch, idx, split):
-            return model(batch)
+        def target_fn(batch, idx, split, lengths=None):
+            del idx, split, lengths
+            return extract_logits(model(batch))
 
     if args.quantized_model is not None:
         q_model, tokenizer, config = load(

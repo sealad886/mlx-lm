@@ -310,7 +310,7 @@ example:
 
 ```yaml
 hf_dataset:
-  path: "billsum"
+  path: "FiscalNote/billsum"
   prompt_feature: "text"
   completion_feature: "summary"
 ```

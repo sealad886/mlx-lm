@@ -43,6 +43,7 @@ from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
+    does_model_support_mtp,
     load,
     maybe_set_recommended_wired_limit,
     sharded_load,
@@ -386,6 +387,10 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+def _xtc_special_tokens(tokenizer):
+    return tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+
+
 def _make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
@@ -394,7 +399,7 @@ def _make_sampler(args, tokenizer):
         min_p=args.sampling.min_p,
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
-        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        xtc_special_tokens=_xtc_special_tokens(tokenizer),
     )
 
 
@@ -761,7 +766,16 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    # Prefer single-sequence MTP when the queue is empty;
+                    # fall back to BatchGenerator when requests are queued.
+                    mtp_active = getattr(
+                        self.cli_args, "mtp", False
+                    ) and does_model_support_mtp(model)
+                    if not self._is_batchable(args) or (
+                        mtp_active
+                        and not self._is_distributed
+                        and self.requests.empty()
+                    ):
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
@@ -956,6 +970,14 @@ class ResponseGenerator:
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
+                mtp=getattr(self.cli_args, "mtp", False),
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=_xtc_special_tokens(tokenizer),
             ):
                 finish_reason = gen.finish_reason
 
@@ -1899,6 +1921,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
     args = parser.parse_args()
     _ = maybe_set_recommended_wired_limit()
